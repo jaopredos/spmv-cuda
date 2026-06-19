@@ -1,0 +1,23 @@
+=== n=16384 esparsidade=0.5 runs=101  sex 19 jun 2026 18:14:56 -03 ===
+
+Benchmark SpMV  n=16384  esparsidade=0.50  nnz=134224021  runs=101 (1 warm-up descartado)
+
++-----------------------------------------+----------+----------+----------+---------+--------+--------+
+| Implementação                         | Méd(ms) | Mín(ms) | Máx(ms) | GFLOP/s |   GB/s | Corret |
++-----------------------------------------+----------+----------+----------+---------+--------+--------+
+| CPU sequencial (CSR)                    |   79.744 |   79.328 |   80.407 |    3.37 |  20.20 |    ref |
+| CPU OpenMP (CSR)                        |   27.849 |   27.633 |   28.097 |    9.64 |  57.85 |     OK |
+| CPU sequencial (SP24)                   |   78.597 |   76.897 |   92.478 |    3.42 |  14.52 |    ref |
+| CPU OpenMP (SP24)                       |   20.729 |   20.594 |   21.328 |   12.95 |  55.05 |     OK |
+| GPU CUDA kernel (CSR)                   |    6.121 |    6.097 |    6.137 |   43.85 | 263.18 |     OK |
+| GPU CUDA cuSPARSE (CSR)                 |    1.688 |    1.687 |    1.690 |  159.02 | 954.31 |     OK |
+| CPU sequencial (MACKO)                  |   87.800 |   87.529 |   89.532 |    3.06 |  16.44 |    ref |
+| CPU OpenMP (MACKO)                      |   26.696 |   26.272 |   26.864 |   10.06 |  54.08 |     OK |
+| GPU CUDA warp/row (MACKO)               |    1.538 |    1.531 |    1.546 |  174.49 | 938.33 |     OK |
+| GPU warp/row (MACKO FP16)               |    0.812 |    0.798 |    0.827 |  330.60 | 785.80 |     OK |
++-----------------------------------------+----------+----------+----------+---------+--------+--------+
+
+Nota: SP24 usa pruning 2:4 (preserva os 2 maiores |v| por grupo de 4).
+      Sua referência é a coluna CPU sequencial (SP24), não a CSR.
+      GFLOP/s e GB/s são teóricos (baseados em nnz e bytes transferidos).
+
