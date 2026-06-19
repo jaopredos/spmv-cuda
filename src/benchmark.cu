@@ -3,6 +3,7 @@
 #include <math.h>
 #include <float.h>
 #include <time.h>
+#include <cuda_fp16.h>
 #include "../include/matrix.h"
 #include "../include/csr.h"
 #include "../include/sp24.h"
@@ -94,6 +95,19 @@ static double bw_macko_gb(const MACKOMatrix *A, int n) {
     return (chunk_bytes + meta_bytes) / 1e9;
 }
 
+/* MACKO FP16: igual ao MACKO SoA mas vals ocupa 2 bytes por slot (FP16)
+   em vez de 8 (double) — redução de 32→8 bytes/chunk em vals            */
+static double bw_macko_fp16_gb(const MACKOMatrix *A, int n) {
+    long tc = A->total_chunks;
+    long cs = MACKO_CHUNK_SIZE;
+    long chunk_bytes = tc * ((long)sizeof(uint8_t)          /* valid_masks */
+                           + (long)sizeof(int16_t)          /* col_bases   */
+                           + cs * (long)sizeof(int16_t)     /* col_deltas  */
+                           + cs * (long)sizeof(__half));    /* vals FP16   */
+    long meta_bytes  = (long)n * (2 * (long)sizeof(int) + 2 * (long)sizeof(double));
+    return (chunk_bytes + meta_bytes) / 1e9;
+}
+
 /* ------------------------------------------------------------------ */
 /* main                                                                 */
 /* ------------------------------------------------------------------ */
@@ -146,7 +160,7 @@ int main(int argc, char *argv[]) {
     printf("\nBenchmark SpMV  n=%d  esparsidade=%.2f  nnz=%d  runs=%d (1 warm-up descartado)\n\n",
            n, sparsity, csr->nnz, runs);
 
-#define N_IMPL 8
+#define N_IMPL 9
     Row table[N_IMPL];
     int ri = 0;
 
@@ -257,6 +271,32 @@ int main(int argc, char *argv[]) {
         table[ri].gflops  = flops_csr / (avg * 1e-3) / 1e9;
         table[ri].gbs     = bw_macko_gb(macko, n) / (avg * 1e-3);
         table[ri].correct = verify(y_ref_macko, y_tmp, n, 1e-6);
+        ri++;
+    }
+
+    /* ---- 9. GPU CUDA MACKO FP16 (precisão mista, warp per row) ---- */
+    {
+        CUDAMACKOFp16Ctx *mctx16 = cuda_macko_fp16_ctx_create(macko, x);
+        double sum = 0, mn = DBL_MAX, mx = 0;
+        for (int r = 0; r < runs; r++) {
+            float ms = cuda_macko_fp16_run(mctx16);
+            if (r == 0) continue;
+            sum += ms;
+            if (ms < mn) mn = ms;
+            if (ms > mx) mx = ms;
+        }
+        double avg = sum / (runs - 1);
+        cuda_macko_fp16_ctx_result(mctx16, y_tmp);
+        cuda_macko_fp16_ctx_destroy(mctx16);
+
+        snprintf(table[ri].name, sizeof(table[ri].name), "GPU warp/row (MACKO FP16)");
+        table[ri].avg_ms  = avg;
+        table[ri].min_ms  = mn;
+        table[ri].max_ms  = mx;
+        table[ri].gflops  = flops_csr / (avg * 1e-3) / 1e9;
+        table[ri].gbs     = bw_macko_fp16_gb(macko, n) / (avg * 1e-3);
+        /* tolerância maior: FP16 tem ~3 casas decimais de precisão */
+        table[ri].correct = verify(y_ref_macko, y_tmp, n, 1e-2);
         ri++;
     }
 
