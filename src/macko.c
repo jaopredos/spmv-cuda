@@ -21,11 +21,18 @@ MACKOMatrix *macko_from_csr(const CSRMatrix *csr) {
     A->cols         = csr->cols;
     A->nnz          = csr->nnz;
     A->total_chunks = total_chunks;
-    A->chunks       = malloc(total_chunks * sizeof(MACKOChunk));
+    A->valid_masks  = calloc(total_chunks, sizeof(uint8_t));
+    A->col_bases    = malloc(total_chunks * sizeof(int16_t));
+    A->col_deltas   = calloc((long)total_chunks * MACKO_CHUNK_SIZE, sizeof(int16_t));
+    A->vals         = calloc((long)total_chunks * MACKO_CHUNK_SIZE, sizeof(double));
     A->row_ptr      = malloc(rows * sizeof(int));
     A->row_nchunks  = malloc(rows * sizeof(int));
 
-    if (!A->chunks || !A->row_ptr || !A->row_nchunks) { macko_free(A); return NULL; }
+    if (!A->valid_masks || !A->col_bases || !A->col_deltas ||
+        !A->vals || !A->row_ptr || !A->row_nchunks) {
+        macko_free(A);
+        return NULL;
+    }
 
     int c = 0;
     for (int i = 0; i < rows; i++) {
@@ -37,17 +44,23 @@ MACKOMatrix *macko_from_csr(const CSRMatrix *csr) {
         A->row_nchunks[i] = nchunks;
 
         for (int g = 0; g < nchunks; g++) {
-            MACKOChunk *chunk = &A->chunks[c++];
+            int base_idx = row_start + g * MACKO_CHUNK_SIZE;
+            int col_base = csr->col_idx[base_idx]; /* k=0 sempre válido */
+
+            A->col_bases[c]   = (int16_t)col_base;
+            A->valid_masks[c] = 0;
+
             for (int k = 0; k < MACKO_CHUNK_SIZE; k++) {
-                int idx = row_start + g * MACKO_CHUNK_SIZE + k;
+                int idx  = base_idx + k;
+                int slot = MACKO_SLOT(c, k);
                 if (idx < row_start + row_nnz) {
-                    chunk->cols[k] = csr->col_idx[idx];
-                    chunk->vals[k] = csr->values[idx];
-                } else {
-                    chunk->cols[k] = -1;
-                    chunk->vals[k] = 0.0;
+                    A->col_deltas[slot] = (int16_t)(csr->col_idx[idx] - col_base);
+                    A->vals[slot]       = csr->values[idx];
+                    A->valid_masks[c]  |= (uint8_t)(1 << k);
                 }
+                /* inválido: col_deltas[slot]=0, vals[slot]=0.0 (calloc já zerou) */
             }
+            c++;
         }
     }
 
@@ -67,7 +80,10 @@ MACKOMatrix *macko_from_matrix(const Matrix *m) {
 
 void macko_free(MACKOMatrix *A) {
     if (!A) return;
-    free(A->chunks);
+    free(A->valid_masks);
+    free(A->col_bases);
+    free(A->col_deltas);
+    free(A->vals);
     free(A->row_ptr);
     free(A->row_nchunks);
     free(A);
@@ -81,13 +97,15 @@ void macko_print(const MACKOMatrix *A) {
     for (int i = 0; i < limit; i++) {
         printf("  row %d (chunks=%d): ", i, A->row_nchunks[i]);
         for (int g = 0; g < A->row_nchunks[i]; g++) {
-            MACKOChunk *chunk = &A->chunks[A->row_ptr[i] + g];
+            int c = A->row_ptr[i] + g;
             printf("[ ");
             for (int k = 0; k < MACKO_CHUNK_SIZE; k++) {
-                if (chunk->cols[k] == -1)
+                if (!(A->valid_masks[c] & (1 << k)))
                     printf("pad ");
-                else
-                    printf("col%d=%.4f ", chunk->cols[k], chunk->vals[k]);
+                else {
+                    int col = A->col_bases[c] + A->col_deltas[MACKO_SLOT(c, k)];
+                    printf("col%d=%.4f ", col, A->vals[MACKO_SLOT(c, k)]);
+                }
             }
             printf("] ");
         }
@@ -101,10 +119,14 @@ void spmv_cpu_macko_sequential(const MACKOMatrix *A, const double *x, double *y)
         int first = A->row_ptr[i];
         int last  = first + A->row_nchunks[i];
         for (int c = first; c < last; c++) {
-            const MACKOChunk *chunk = &A->chunks[c];
-            for (int k = 0; k < MACKO_CHUNK_SIZE; k++)
-                if (chunk->cols[k] != -1)
-                    acc += chunk->vals[k] * x[chunk->cols[k]];
+            uint8_t mask = A->valid_masks[c];
+            int16_t base = A->col_bases[c];
+            for (int k = 0; k < MACKO_CHUNK_SIZE; k++) {
+                if (mask & (1 << k)) {
+                    int col = (int)base + (int)A->col_deltas[MACKO_SLOT(c, k)];
+                    acc += A->vals[MACKO_SLOT(c, k)] * x[col];
+                }
+            }
         }
         y[i] = acc;
     }
@@ -118,10 +140,14 @@ void spmv_cpu_macko_openmp(const MACKOMatrix *A, const double *x, double *y) {
         int first = A->row_ptr[i];
         int last  = first + A->row_nchunks[i];
         for (int c = first; c < last; c++) {
-            const MACKOChunk *chunk = &A->chunks[c];
-            for (int k = 0; k < MACKO_CHUNK_SIZE; k++)
-                if (chunk->cols[k] != -1)
-                    acc += chunk->vals[k] * x[chunk->cols[k]];
+            uint8_t mask = A->valid_masks[c];
+            int16_t base = A->col_bases[c];
+            for (int k = 0; k < MACKO_CHUNK_SIZE; k++) {
+                if (mask & (1 << k)) {
+                    int col = (int)base + (int)A->col_deltas[MACKO_SLOT(c, k)];
+                    acc += A->vals[MACKO_SLOT(c, k)] * x[col];
+                }
+            }
         }
         y[i] = acc;
     }
