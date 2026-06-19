@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <cuda_fp16.h>
 #include "../include/spmv_cuda.h"
 
 #define CUDA_CHECK(call)                                                   \
@@ -178,6 +179,160 @@ void cuda_macko_ctx_destroy(CUDAMACKOCtx *ctx) {
     cudaFree(ctx->d_col_bases);
     cudaFree(ctx->d_col_deltas);
     cudaFree(ctx->d_vals);
+    cudaFree(ctx->d_row_ptr);
+    cudaFree(ctx->d_row_nchunks);
+    cudaFree(ctx->d_x);
+    cudaFree(ctx->d_y);
+    free(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* Kernel FP16: valores armazenados em __half, acumulação em double    */
+/* ------------------------------------------------------------------ */
+
+__global__ void kernel_macko_warp_per_row_fp16(
+        int             rows,
+        const uint8_t  *valid_masks,
+        const int16_t  *col_bases,
+        const int16_t  *col_deltas,
+        const __half   *vals_fp16,   /* FP16 em vez de double */
+        const int      *row_ptr,
+        const int      *row_nchunks,
+        const double   *x,
+        double         *y)
+{
+    int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+    int lane    = threadIdx.x % 32;
+    if (warp_id >= rows) return;
+
+    double acc            = 0.0;
+    int    primeiro_chunk = row_ptr[warp_id];
+    int    nchunks        = row_nchunks[warp_id];
+
+    for (int c = lane; c < nchunks; c += 32) {
+        int     chunk_idx = primeiro_chunk + c;
+        uint8_t mask      = valid_masks[chunk_idx];
+        int16_t base      = col_bases[chunk_idx];
+        for (int k = 0; k < MACKO_CHUNK_SIZE; k++) {
+            if (mask & (1 << k)) {
+                int col = (int)base + (int)col_deltas[chunk_idx * MACKO_CHUNK_SIZE + k];
+                /* conversão FP16 → float → double on-the-fly antes da multiplicação
+                   (cuda_fp16.h não expõe __half2double; só half<->float) */
+                double val = (double)__half2float(vals_fp16[chunk_idx * MACKO_CHUNK_SIZE + k]);
+                acc += val * x[col];
+            }
+        }
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+
+    if (lane == 0) y[warp_id] = acc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Contexto FP16: buffers persistem entre runs                         */
+/* ------------------------------------------------------------------ */
+
+struct CUDAMACKOFp16Ctx {
+    uint8_t     *d_valid_masks;
+    int16_t     *d_col_bases;
+    int16_t     *d_col_deltas;
+    __half      *d_vals_fp16;    /* FP16 — 2 bytes por slot */
+    int         *d_row_ptr;
+    int         *d_row_nchunks;
+    double      *d_x;
+    double      *d_y;
+    int          rows;
+    int          tpb;
+    int          blocks;
+    cudaEvent_t  ev_start;
+    cudaEvent_t  ev_stop;
+};
+
+extern "C"
+CUDAMACKOFp16Ctx *cuda_macko_fp16_ctx_create(const MACKOMatrix *A, const double *x) {
+    CUDAMACKOFp16Ctx *ctx = (CUDAMACKOFp16Ctx *)malloc(sizeof(CUDAMACKOFp16Ctx));
+    if (!ctx) return NULL;
+
+    ctx->rows   = A->rows;
+    ctx->tpb    = 256;
+    ctx->blocks = (A->rows * 32 + ctx->tpb - 1) / ctx->tpb;
+
+    long tc  = A->total_chunks;
+    long cs  = MACKO_CHUNK_SIZE;
+    long nsl = tc * cs;   /* total de slots */
+
+    /* converter vals double → __half na CPU */
+    __half *vals_fp16_host = (__half *)malloc(nsl * sizeof(__half));
+    if (!vals_fp16_host) { free(ctx); return NULL; }
+    for (long i = 0; i < nsl; i++)
+        vals_fp16_host[i] = __double2half(A->vals[i]);
+
+    CUDA_CHECK(cudaMalloc(&ctx->d_valid_masks, tc * sizeof(uint8_t)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_col_bases,  tc * sizeof(int16_t)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_col_deltas, nsl * sizeof(int16_t)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_vals_fp16,  nsl * sizeof(__half)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_row_ptr,    A->rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_row_nchunks, A->rows * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_x,          A->cols * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_y,          A->rows * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(ctx->d_valid_masks, A->valid_masks,
+        tc * sizeof(uint8_t),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_col_bases, A->col_bases,
+        tc * sizeof(int16_t),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_col_deltas, A->col_deltas,
+        nsl * sizeof(int16_t),      cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_vals_fp16, vals_fp16_host,
+        nsl * sizeof(__half),       cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_row_ptr,    A->row_ptr,
+        A->rows * sizeof(int),      cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_row_nchunks, A->row_nchunks,
+        A->rows * sizeof(int),      cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_x, x,
+        A->cols * sizeof(double),   cudaMemcpyHostToDevice));
+
+    free(vals_fp16_host);
+
+    CUDA_CHECK(cudaEventCreate(&ctx->ev_start));
+    CUDA_CHECK(cudaEventCreate(&ctx->ev_stop));
+
+    return ctx;
+}
+
+extern "C"
+float cuda_macko_fp16_run(CUDAMACKOFp16Ctx *ctx) {
+    CUDA_CHECK(cudaEventRecord(ctx->ev_start));
+    kernel_macko_warp_per_row_fp16<<<ctx->blocks, ctx->tpb>>>(
+        ctx->rows,
+        ctx->d_valid_masks, ctx->d_col_bases, ctx->d_col_deltas, ctx->d_vals_fp16,
+        ctx->d_row_ptr, ctx->d_row_nchunks,
+        ctx->d_x, ctx->d_y);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(ctx->ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(ctx->ev_stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ctx->ev_start, ctx->ev_stop));
+    return ms;
+}
+
+extern "C"
+void cuda_macko_fp16_ctx_result(CUDAMACKOFp16Ctx *ctx, double *y) {
+    CUDA_CHECK(cudaMemcpy(y, ctx->d_y, ctx->rows * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+}
+
+extern "C"
+void cuda_macko_fp16_ctx_destroy(CUDAMACKOFp16Ctx *ctx) {
+    if (!ctx) return;
+    cudaEventDestroy(ctx->ev_start);
+    cudaEventDestroy(ctx->ev_stop);
+    cudaFree(ctx->d_valid_masks);
+    cudaFree(ctx->d_col_bases);
+    cudaFree(ctx->d_col_deltas);
+    cudaFree(ctx->d_vals_fp16);
     cudaFree(ctx->d_row_ptr);
     cudaFree(ctx->d_row_nchunks);
     cudaFree(ctx->d_x);
