@@ -80,11 +80,18 @@ static double bw_sp24_gb(int n) {
     return ((long)n * n / 2 * 8.0 + (long)n * n / 4.0 + n * 16.0) / 1e9;
 }
 
-/* MACKO: lê chunks(total_chunks * sizeof(MACKOChunk)), row_ptr(n*4),
+/* MACKO (SoA): lê valid_masks(total_chunks*1), col_bases(total_chunks*2),
+   col_deltas(total_chunks*4*2), vals(total_chunks*4*8), row_ptr(n*4),
    row_nchunks(n*4), x(n*8); escreve y(n*8) */
 static double bw_macko_gb(const MACKOMatrix *A, int n) {
-    return ((long)A->total_chunks * sizeof(MACKOChunk)
-            + n * 4L * 2 + n * 16L) / 1e9;
+    long tc = A->total_chunks;
+    long cs = MACKO_CHUNK_SIZE;
+    long chunk_bytes = tc * ((long)sizeof(uint8_t)          /* valid_masks */
+                           + (long)sizeof(int16_t)          /* col_bases   */
+                           + cs * (long)sizeof(int16_t)     /* col_deltas  */
+                           + cs * (long)sizeof(double));    /* vals        */
+    long meta_bytes  = (long)n * (2 * (long)sizeof(int) + 2 * (long)sizeof(double));
+    return (chunk_bytes + meta_bytes) / 1e9;
 }
 
 /* ------------------------------------------------------------------ */
