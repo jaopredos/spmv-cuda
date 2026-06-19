@@ -35,6 +35,14 @@ float          cuda_macko_run(CUDAMACKOCtx *ctx);           /* retorna ms */
 void           cuda_macko_ctx_result(CUDAMACKOCtx *ctx, double *y);
 void           cuda_macko_ctx_destroy(CUDAMACKOCtx *ctx);
 
+/* ---- MACKO GPU — precisão mista FP16/FP64 ---- */
+typedef struct CUDAMACKOFp16Ctx CUDAMACKOFp16Ctx;  /* opaque */
+
+CUDAMACKOFp16Ctx *cuda_macko_fp16_ctx_create(const MACKOMatrix *A, const double *x);
+float              cuda_macko_fp16_run(CUDAMACKOFp16Ctx *ctx);
+void               cuda_macko_fp16_ctx_result(CUDAMACKOFp16Ctx *ctx, double *y);
+void               cuda_macko_fp16_ctx_destroy(CUDAMACKOFp16Ctx *ctx);
+
 #ifdef __cplusplus
 }
 #endif
