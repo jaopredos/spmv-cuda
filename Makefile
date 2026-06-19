@@ -4,7 +4,7 @@ ARCH      = -arch=sm_89
 
 CFLAGS    = -O3 -fopenmp -Wall -Iinclude
 NVCCFLAGS = -O3 $(ARCH) -Xcompiler -fopenmp -Iinclude
-LDFLAGS   = -Xcompiler -fopenmp -lm
+LDFLAGS   = -Xcompiler -fopenmp -lm -lcusparse
 
 BUILD_DIR = build
 

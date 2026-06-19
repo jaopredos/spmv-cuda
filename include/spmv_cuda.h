@@ -27,6 +27,14 @@ float        cuda_spmv_run(CUDASpMVCtx *ctx);
 void         cuda_spmv_ctx_result(CUDASpMVCtx *ctx, double *y);
 void         cuda_spmv_ctx_destroy(CUDASpMVCtx *ctx);
 
+/* ---- cuSPARSE GPU ---- */
+typedef struct CUDACuSparseCtx CUDACuSparseCtx;  /* opaque */
+
+CUDACuSparseCtx *cuda_cusparse_ctx_create(const CSRMatrix *A, const double *x);
+float            cuda_cusparse_run(CUDACuSparseCtx *ctx);
+void             cuda_cusparse_ctx_result(CUDACuSparseCtx *ctx, double *y);
+void             cuda_cusparse_ctx_destroy(CUDACuSparseCtx *ctx);
+
 /* ---- MACKO GPU ---- */
 typedef struct CUDAMACKOCtx CUDAMACKOCtx;  /* opaque */
 

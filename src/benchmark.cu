@@ -160,7 +160,7 @@ int main(int argc, char *argv[]) {
     printf("\nBenchmark SpMV  n=%d  esparsidade=%.2f  nnz=%d  runs=%d (1 warm-up descartado)\n\n",
            n, sparsity, csr->nnz, runs);
 
-#define N_IMPL 9
+#define N_IMPL 10
     Row table[N_IMPL];
     int ri = 0;
 
@@ -238,18 +238,45 @@ int main(int argc, char *argv[]) {
         ri++;
     }
 
-    /* ---- 6. CPU sequencial MACKO ---- */
+    /* ---- 6. GPU CUDA cuSPARSE (CSR) ---- */
+    {
+        CUDACuSparseCtx *ctx = cuda_cusparse_ctx_create(csr, x);
+
+        double sum = 0, mn = DBL_MAX, mx = 0;
+        for (int r = 0; r < runs; r++) {
+            float ms = cuda_cusparse_run(ctx);
+            if (r == 0) continue; /* warm-up */
+            sum += ms;
+            if (ms < mn) mn = ms;
+            if (ms > mx) mx = ms;
+        }
+        double avg = sum / (runs - 1);
+
+        cuda_cusparse_ctx_result(ctx, y_tmp);
+        cuda_cusparse_ctx_destroy(ctx);
+
+        snprintf(table[ri].name, sizeof(table[ri].name), "GPU CUDA cuSPARSE (CSR)");
+        table[ri].avg_ms  = avg;
+        table[ri].min_ms  = mn;
+        table[ri].max_ms  = mx;
+        table[ri].gflops  = flops_csr / (avg * 1e-3) / 1e9;
+        table[ri].gbs     = bw_csr    / (avg * 1e-3);
+        table[ri].correct = verify(y_ref, y_tmp, n, 1e-6);
+        ri++;
+    }
+
+    /* ---- 7. CPU sequencial MACKO ---- */
     double *y_ref_macko = (double *)calloc(n, sizeof(double));
     BENCH_CPU("CPU sequencial (MACKO)",
               spmv_cpu_macko_sequential(macko, x, y_ref_macko),
               y_ref_macko, NULL, flops_csr, bw_macko_gb(macko, n));
 
-    /* ---- 7. CPU OpenMP MACKO ---- */
+    /* ---- 8. CPU OpenMP MACKO ---- */
     BENCH_CPU("CPU OpenMP (MACKO)",
               spmv_cpu_macko_openmp(macko, x, y_tmp),
               y_tmp, y_ref_macko, flops_csr, bw_macko_gb(macko, n));
 
-    /* ---- 8. GPU CUDA MACKO (warp per row) ---- */
+    /* ---- 9. GPU CUDA MACKO (warp per row) ---- */
     {
         CUDAMACKOCtx *mctx = cuda_macko_ctx_create(macko, x);
         double sum = 0, mn = DBL_MAX, mx = 0;
@@ -274,7 +301,7 @@ int main(int argc, char *argv[]) {
         ri++;
     }
 
-    /* ---- 9. GPU CUDA MACKO FP16 (precisão mista, warp per row) ---- */
+    /* ---- 10. GPU CUDA MACKO FP16 (precisão mista, warp per row) ---- */
     {
         CUDAMACKOFp16Ctx *mctx16 = cuda_macko_fp16_ctx_create(macko, x);
         double sum = 0, mn = DBL_MAX, mx = 0;

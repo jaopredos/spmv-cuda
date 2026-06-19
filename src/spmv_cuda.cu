@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <cusparse.h>
 #include "../include/spmv_cuda.h"
 
 #define CUDA_CHECK(call)                                                   \
@@ -8,6 +9,16 @@
         if (err != cudaSuccess) {                                          \
             fprintf(stderr, "CUDA error %s:%d — %s\n",                    \
                     __FILE__, __LINE__, cudaGetErrorString(err));           \
+            exit(EXIT_FAILURE);                                            \
+        }                                                                  \
+    } while (0)
+
+#define CUSPARSE_CHECK(call)                                               \
+    do {                                                                   \
+        cusparseStatus_t err = (call);                                     \
+        if (err != CUSPARSE_STATUS_SUCCESS) {                              \
+            fprintf(stderr, "cuSPARSE error %s:%d — code %d\n",            \
+                    __FILE__, __LINE__, (int)err);                         \
             exit(EXIT_FAILURE);                                            \
         }                                                                  \
     } while (0)
@@ -140,5 +151,108 @@ void cuda_spmv_ctx_destroy(CUDASpMVCtx *ctx) {
     cudaFree(ctx->d_row_ptr);
     cudaFree(ctx->d_x);
     cudaFree(ctx->d_y);
+    free(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/* cuSPARSE: Contexto e wrappers                                      */
+/* ------------------------------------------------------------------ */
+
+struct CUDACuSparseCtx {
+    cusparseHandle_t     handle;
+    cusparseSpMatDescr_t matA;
+    cusparseDnVecDescr_t vecX;
+    cusparseDnVecDescr_t vecY;
+    double              *d_values;
+    int                 *d_col_idx;
+    int                 *d_row_ptr;
+    double              *d_x;
+    double              *d_y;
+    void                *d_buffer;
+    size_t               bufferSize;
+    int                  rows;
+    double               alpha;
+    double               beta;
+    cudaEvent_t          ev_start;
+    cudaEvent_t          ev_stop;
+};
+
+extern "C"
+CUDACuSparseCtx *cuda_cusparse_ctx_create(const CSRMatrix *A, const double *x) {
+    CUDACuSparseCtx *ctx = (CUDACuSparseCtx *)malloc(sizeof(CUDACuSparseCtx));
+    if (!ctx) return NULL;
+
+    ctx->rows   = A->rows;
+    ctx->alpha  = 1.0;
+    ctx->beta   = 0.0;
+
+    CUDA_CHECK(cudaMalloc(&ctx->d_values,  A->nnz        * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_col_idx, A->nnz        * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_row_ptr, (A->rows + 1) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_x,       A->cols       * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&ctx->d_y,       A->rows       * sizeof(double)));
+
+    CUDA_CHECK(cudaMemcpy(ctx->d_values,  A->values,  A->nnz        * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_col_idx, A->col_idx, A->nnz        * sizeof(int),    cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_row_ptr, A->row_ptr, (A->rows + 1) * sizeof(int),    cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(ctx->d_x,       x,          A->cols       * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(ctx->d_y,       0,          A->rows       * sizeof(double)));
+
+    CUSPARSE_CHECK(cusparseCreate(&ctx->handle));
+
+    CUSPARSE_CHECK(cusparseCreateCsr(&ctx->matA, A->rows, A->cols, A->nnz,
+                                     ctx->d_row_ptr, ctx->d_col_idx, ctx->d_values,
+                                     CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
+                                     CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F));
+
+    CUSPARSE_CHECK(cusparseCreateDnVec(&ctx->vecX, A->cols, ctx->d_x, CUDA_R_64F));
+    CUSPARSE_CHECK(cusparseCreateDnVec(&ctx->vecY, A->rows, ctx->d_y, CUDA_R_64F));
+
+    CUSPARSE_CHECK(cusparseSpMV_bufferSize(ctx->handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                           &ctx->alpha, ctx->matA, ctx->vecX, &ctx->beta, ctx->vecY,
+                                           CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &ctx->bufferSize));
+
+    CUDA_CHECK(cudaMalloc(&ctx->d_buffer, ctx->bufferSize));
+
+    CUDA_CHECK(cudaEventCreate(&ctx->ev_start));
+    CUDA_CHECK(cudaEventCreate(&ctx->ev_stop));
+
+    return ctx;
+}
+
+extern "C"
+float cuda_cusparse_run(CUDACuSparseCtx *ctx) {
+    CUDA_CHECK(cudaEventRecord(ctx->ev_start));
+    CUSPARSE_CHECK(cusparseSpMV(ctx->handle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                                &ctx->alpha, ctx->matA, ctx->vecX, &ctx->beta, ctx->vecY,
+                                CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, ctx->d_buffer));
+    CUDA_CHECK(cudaEventRecord(ctx->ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(ctx->ev_stop));
+
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ctx->ev_start, ctx->ev_stop));
+    return ms;
+}
+
+extern "C"
+void cuda_cusparse_ctx_result(CUDACuSparseCtx *ctx, double *y) {
+    CUDA_CHECK(cudaMemcpy(y, ctx->d_y, ctx->rows * sizeof(double), cudaMemcpyDeviceToHost));
+}
+
+extern "C"
+void cuda_cusparse_ctx_destroy(CUDACuSparseCtx *ctx) {
+    if (!ctx) return;
+    cudaEventDestroy(ctx->ev_start);
+    cudaEventDestroy(ctx->ev_stop);
+    cusparseDestroySpMat(ctx->matA);
+    cusparseDestroyDnVec(ctx->vecX);
+    cusparseDestroyDnVec(ctx->vecY);
+    cusparseDestroy(ctx->handle);
+    cudaFree(ctx->d_values);
+    cudaFree(ctx->d_col_idx);
+    cudaFree(ctx->d_row_ptr);
+    cudaFree(ctx->d_x);
+    cudaFree(ctx->d_y);
+    cudaFree(ctx->d_buffer);
     free(ctx);
 }
