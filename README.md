@@ -150,10 +150,7 @@ além de um log combinado `results/all_<timestamp>.log`.
     `nsys stats trace.nsys-rep` — não exige permissões elevadas, dá tempo de
     kernel e contagem de chamadas de API/memória.
   - `ncu` (Nsight Compute) dá métricas de hardware (cache hit rate,
-    ocupância, divergência), mas exige acesso a contadores de performance da
-    GPU, frequentemente bloqueado em laboratórios compartilhados
-    (`ERR_NVGPUCTRPERM`). Nesse caso, peça ao administrador para rodar com
-    `sudo` ou liberar `NVreg_RestrictProfilingToAdminUsers=0`.
+    ocupância, divergência).
 
 ---
 
@@ -164,5 +161,3 @@ além de um log combinado `results/all_<timestamp>.log`.
   cada resultado de desempenho.
 - `resultados.md` — saídas brutas do benchmark coletadas durante o
   desenvolvimento.
-- `prompt_*.md` — especificações usadas para guiar cada etapa da
-  implementação (formato MACKO inicial, delta encoding, SoA, FP16).
